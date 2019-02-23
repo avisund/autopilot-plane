@@ -58,9 +58,25 @@ void setup()
 }
 
 int16_t packetnum = 0;  // packet counter, we increment per xmission
+char rxBuffer[6]; // for reading serial
+int index = 0;
 
 void loop()
 {
+  if (Serial.available())
+  {
+    char c = Serial.read();
+    Serial.print("received: ");
+    Serial.println(c);
+//    if(index >= sizeof(rxBuffer))
+//    {
+//      index = 0;
+//      Serial.print("Received from computer: ");
+//      Serial.print(rxBuffer);
+//    }
+//    rxBuffer[index] = Serial.read();
+//    ++index;
+  }
   Serial.println("Sending to rf95_server");
   // Send a message to rf95_server
   
@@ -98,5 +114,5 @@ void loop()
   {
     Serial.println("No reply, is there a listener around?");
   }
-  delay(1000);
+//  delay(1000);
 }
