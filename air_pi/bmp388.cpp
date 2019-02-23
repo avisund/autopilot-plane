@@ -13,23 +13,13 @@
 
 int bmp;
 
-enum OSS {      // BMP-085 sampling rate
-    OSS_0 = 0,  // 4.5 ms conversion time
-    OSS_1,      // 7.5
-    OSS_2,      // 13.5
-    OSS_3       // 25.5
-};
-
-// Specify sensor parameters
-uint8_t OSS = OSS_3;  // maximum pressure resolution
-
 uint32_t readTemp() {
     wiringPiI2CWriteReg8(bmp, BMP388_PWR_CTRL, 0x2E);
     return ((uint8_t)wiringPiI2CReadReg8(bmp, BMP388_TEMP_2) << 16) + ((uint8_t)wiringPiI2CReadReg8(bmp, BMP388_TEMP_1) << 8) + (uint8_t)wiringPiI2CReadReg8(bmp, BMP388_TEMP_0);
 }
 
 uint32_t readPressure() {
-    wiringPiI2CWriteReg8(bmp, BMP388_PWR_CTRL, 0x1D);  //0x34 | OSS << 6);
+    wiringPiI2CWriteReg8(bmp, BMP388_PWR_CTRL, 0x1D);
     usleep(100000);
     return ((uint8_t)wiringPiI2CReadReg8(bmp, BMP388_PRES_2) << 16) + ((uint8_t)wiringPiI2CReadReg8(bmp, BMP388_PRES_1) << 8) + (uint8_t)wiringPiI2CReadReg8(bmp, BMP388_PRES_0);
 }
