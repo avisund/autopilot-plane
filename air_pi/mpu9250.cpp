@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <wiringPiI2C.h>
 #include <iostream>
+#include "MadgwickAHRS.h"
 
 using namespace std;
 
@@ -411,6 +412,25 @@ void calibrateMPU9250() {
     wiringPiI2CWriteReg8(mpu, ZA_OFFSET_L, data[5]);
 }
 
+void toEulerAngle(double qw, double qx, double qy, double qz, double& roll, double& pitch, double& yaw) {
+    // roll (x-axis rotation)
+    double sinr_cosp = +2.0 * (qw * qx + qy * qz);
+    double cosr_cosp = +1.0 - 2.0 * (qx * qx + qy * qy);
+    roll = atan2(sinr_cosp, cosr_cosp);
+
+    // pitch (y-axis rotation)
+    double sinp = +2.0 * (qw * qy - qz * qx);
+    if (fabs(sinp) >= 1)
+        pitch = copysign(M_PI / 2, sinp);  // use 90 degrees if out of range
+    else
+        pitch = asin(sinp);
+
+    // yaw (z-axis rotation)
+    double siny_cosp = +2.0 * (qw * qz + qx * qy);
+    double cosy_cosp = +1.0 - 2.0 * (qy * qy + qz * qz);
+    yaw = atan2(siny_cosp, cosy_cosp);
+}
+
 int main() {
     // int fd, result;
     mpu = wiringPiI2CSetup(MPU9250_ADDRESS);
@@ -465,15 +485,23 @@ int main() {
     // }
 
     while (1) {
-        usleep(100000);
+        // usleep(100000);
         int16_t accl[3];
         int16_t gyro[3];
         int16_t m_mag[3];
         readAccelData(accl);
         readGyroData(gyro);
         readMagData(m_mag);
-        cout << "accel: x " << accl[0] << endl;  //", y "<<accl[1]<<", z "<<accl[2]<<endl;
-        cout << "gyro: x " << gyro[0] << endl;   //", y "<<gyro[1]<<", z "<<gyro[2]<<endl;
-        cout << "mag: x " << m_mag[0] << ", y " << m_mag[1] << ", z " << m_mag[2] << endl;
+        // cout << "accel: x " << accl[0]/1000.0 << endl;  //", y "<<accl[1]<<", z "<<accl[2]<<endl;
+        // cout << "gyro: x " << gyro[0] << endl;   //", y "<<gyro[1]<<", z "<<gyro[2]<<endl;
+        // cout << "mag: x " << m_mag[0] << ", y " << m_mag[1] << ", z " << m_mag[2] << endl;
+        MadgwickAHRSupdate(gyro[0], gyro[1], gyro[2], accl[0], accl[1], accl[2], m_mag[0], m_mag[1], m_mag[2]);
+        double roll, pitch, yaw;
+        toEulerAngle(q0, q1, q2, q3, roll, pitch, yaw);
+        cout << "roll: " << roll << std::endl;
+        cout << "pitch: " << pitch << std::endl;
+        cout << "yaw: " << yaw << std::endl
+             << std::endl
+             << std::endl;
     }
 }
