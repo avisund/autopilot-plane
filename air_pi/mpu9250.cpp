@@ -23,7 +23,6 @@ using namespace std;
 #define AK8963_ASAY 0x11    // Fuse ROM y-axis sensitivity adjustment value
 #define AK8963_ASAZ 0x12    // Fuse ROM z-axis sensitivity adjustment value
 
-
 #define SELF_TEST_X_GYRO 0x00
 #define SELF_TEST_Y_GYRO 0x01
 #define SELF_TEST_Z_GYRO 0x02
@@ -156,6 +155,31 @@ using namespace std;
 //mbed uses the eight-bit device address, so shift seven-bit addresses left by one!
 #define MPU9250_ADDRESS 0x68
 
+// Set initial input parameters
+enum Ascale {
+    AFS_2G = 0,
+    AFS_4G,
+    AFS_8G,
+    AFS_16G
+};
+
+enum Gscale {
+    GFS_250DPS = 0,
+    GFS_500DPS,
+    GFS_1000DPS,
+    GFS_2000DPS
+};
+
+enum Mscale {
+    MFS_14BITS = 0,  // 0.6 mG per LSB
+    MFS_16BITS       // 0.15 mG per LSB
+};
+
+// Specify sensor full scale
+uint8_t Gscale = GFS_250DPS;
+uint8_t Ascale = AFS_2G;
+uint8_t Mscale = MFS_16BITS;  // Choose either 14-bit or 16-bit magnetometer resolution
+
 int mpu, mag;
 
 void readAccelData(int16_t* destination) {
@@ -182,13 +206,216 @@ void readMagData(int16_t* destination) {
             cout << "no mag update" << endl;
         }
     } else {
-        cout << "failed to read mag" << endl; 
+        cout << "failed to read mag" << endl;
     }
+}
+
+void initMPU9250() {
+    // https://github.com/kriswiner/MPU9250/blob/master/MPU9250BasicAHRS.ino
+    wiringPiI2CWriteReg8(mpu, PWR_MGMT_1, 0x00);  // Clear sleep mode bit (6), enable all sensors
+    usleep(10000);                                // Wait for all registers to reset
+                                                  // get stable time source
+    wiringPiI2CWriteReg8(mpu, PWR_MGMT_1, 0x01);  // Auto select clock source to be PLL gyroscope reference if ready else
+    usleep(20000);
+
+    // Configure Gyro and Thermometer
+    // Disable FSYNC and set thermometer and gyro bandwidth to 41 and 42 Hz, respectively;
+    // minimum delay time for this setting is 5.9 ms, which means sensor fusion update rates cannot
+    // be higher than 1 / 0.0059 = 170 Hz
+    // DLPF_CFG = bits 2:0 = 011; this limits the sample rate to 1000 Hz for both
+    // With the MPU9250, it is possible to get gyro sample rates of 32 kHz (!), 8 kHz, or 1 kHz
+    wiringPiI2CWriteReg8(mpu, CONFIG, 0x03);
+
+    // Set sample rate = gyroscope output rate/(1 + SMPLRT_DIV)
+    wiringPiI2CWriteReg8(mpu, SMPLRT_DIV, 0x04);  // Use a 200 Hz rate; a rate consistent with the filter update rate
+    // determined inset in CONFIG above
+    // gyro setup full range
+    uint8_t c = wiringPiI2CReadReg8(mpu, GYRO_CONFIG);
+    c = c & ~0x03;        // Clear Fchoice bits [1:0]
+    c = c & ~0x18;        // Clear GFS bits [4:3]
+    c = c | Gscale << 3;  // Set full scale range for the gyro
+    wiringPiI2CWriteReg8(mpu, GYRO_CONFIG, c);
+
+    // acc full range
+    // c = readByte(MPU9250_ADDRESS, ACCEL_CONFIG);  // get current ACCEL_CONFIG register value
+    // c = c & ~0xE0; // Clear self-test bits [7:5]
+    c = wiringPiI2CReadReg8(mpu, ACCEL_CONFIG);
+    c = c & ~0x18;        // Clear AFS bits [4:3]
+    c = c | Ascale << 3;  // Set full scale range for the accelerometer
+    wiringPiI2CWriteReg8(mpu, ACCEL_CONFIG, c);
+
+    // Set accelerometer sample rate configuration
+    // It is possible to get a 4 kHz sample rate from the accelerometer by choosing 1 for
+    // accel_fchoice_b bit [3]; in this case the bandwidth is 1.13 kHz
+    c = wiringPiI2CReadReg8(mpu, ACCEL_CONFIG2);  // get current ACCEL_CONFIG2 register value
+    c = c & ~0x0F;                                // Clear accel_fchoice_b (bit 3) and A_DLPFG (bits [2:0])
+    c = c | 0x03;                                 // Set accelerometer rate to 1 kHz and bandwidth to 41 Hz
+    wiringPiI2CWriteReg8(mpu, ACCEL_CONFIG2, c);  // Write new ACCEL_CONFIG2 register value
+                                                  // The accelerometer, gyro, and thermometer are set to 1 kHz sample rates,
+                                                  // but all these rates are further reduced by a factor of 5 to 200 Hz because of the SMPLRT_DIV setting
+
+    // Configure Interrupts and Bypass Enable
+    // Set interrupt pin active high, push-pull, hold interrupt pin level HIGH until interrupt cleared,
+    // clear on read of INT_STATUS, and enable I2C_BYPASS_EN so additional chips
+    // can join the I2C bus and all can be controlled by the pi as master
+    wiringPiI2CWriteReg8(mpu, INT_PIN_CFG, 0x22);
+    wiringPiI2CWriteReg8(mpu, INT_ENABLE, 0x01);  // Enable data ready (bit 0) interrupt
+    usleep(10000);
+}
+
+void calibrateMPU9250() {
+    uint8_t data[12];  // data array to hold accelerometer and gyro x, y, z, data
+    uint16_t ii, packet_count, fifo_count;
+    int32_t gyro_bias[3] = {0, 0, 0}, accel_bias[3] = {0, 0, 0};
+
+    // reset device
+    wiringPiI2CWriteReg8(mpu, PWR_MGMT_1, 0x80);  // Write a one to bit 7 reset bit; toggle reset device
+    usleep(10000);
+
+    // get stable time source; Auto select clock source to be PLL gyroscope reference if ready
+    // else use the internal oscillator, bits 2:0 = 001
+    wiringPiI2CWriteReg8(mpu, PWR_MGMT_1, 0x01);
+    wiringPiI2CWriteReg8(mpu, PWR_MGMT_2, 0x00);
+    usleep(20000);
+
+    // Configure device for bias calculation
+    wiringPiI2CWriteReg8(mpu, INT_ENABLE, 0x00);    // Disable all interrupts
+    wiringPiI2CWriteReg8(mpu, FIFO_EN, 0x00);       // Disable FIFO
+    wiringPiI2CWriteReg8(mpu, PWR_MGMT_1, 0x00);    // Turn on internal clock source
+    wiringPiI2CWriteReg8(mpu, I2C_MST_CTRL, 0x00);  // Disable I2C master
+    wiringPiI2CWriteReg8(mpu, USER_CTRL, 0x00);     // Disable FIFO and I2C master modes
+    wiringPiI2CWriteReg8(mpu, USER_CTRL, 0x0C);     // Reset FIFO and DMP
+    usleep(1500);
+
+    // Configure MPU6050 gyro and accelerometer for bias calculation
+    wiringPiI2CWriteReg8(mpu, CONFIG, 0x01);        // Set low-pass filter to 188 Hz
+    wiringPiI2CWriteReg8(mpu, SMPLRT_DIV, 0x00);    // Set sample rate to 1 kHz
+    wiringPiI2CWriteReg8(mpu, GYRO_CONFIG, 0x00);   // Set gyro full-scale to 250 degrees per second, maximum sensitivity
+    wiringPiI2CWriteReg8(mpu, ACCEL_CONFIG, 0x00);  // Set accelerometer full-scale to 2 g, maximum sensitivity
+
+    uint16_t gyrosensitivity = 131;     // = 131 LSB/degrees/sec
+    uint16_t accelsensitivity = 16384;  // = 16384 LSB/g
+
+    // Configure FIFO to capture accelerometer and gyro data for bias calculation
+    wiringPiI2CWriteReg8(mpu, USER_CTRL, 0x40);  // Enable FIFO
+    wiringPiI2CWriteReg8(mpu, FIFO_EN, 0x78);    // Enable gyro and accelerometer sensors for FIFO  (max size 512 bytes in MPU-9150)
+    usleep(4000);                                // accumulate 40 samples in 40 milliseconds = 480 bytes
+
+    // At end of sample accumulation, turn off FIFO sensor read
+    wiringPiI2CWriteReg8(mpu, FIFO_EN, 0x00);  // Disable gyro and accelerometer sensors for FIFO
+    data[0] = wiringPiI2CReadReg8(mpu, FIFO_COUNTH);
+    data[1] = wiringPiI2CReadReg8(mpu, FIFO_COUNTL);
+    fifo_count = ((uint16_t)data[0] << 8) | data[1];
+    packet_count = fifo_count / 12;  // How many sets of full gyro and accelerometer data for averaging
+
+    for (ii = 0; ii < packet_count; ii++) {
+        int16_t accel_temp[3] = {0, 0, 0}, gyro_temp[3] = {0, 0, 0};
+        for (int tmp = 0; tmp < 12; ++tmp) {
+            data[tmp] = wiringPiI2CReadReg8(mpu, FIFO_R_W + tmp);
+        }
+        // readBytes(MPU9250_ADDRESS, FIFO_R_W, 12, &data[0]);            // read data for averaging
+        accel_temp[0] = (int16_t)(((int16_t)data[0] << 8) | data[1]);  // Form signed 16-bit integer for each sample in FIFO
+        accel_temp[1] = (int16_t)(((int16_t)data[2] << 8) | data[3]);
+        accel_temp[2] = (int16_t)(((int16_t)data[4] << 8) | data[5]);
+        gyro_temp[0] = (int16_t)(((int16_t)data[6] << 8) | data[7]);
+        gyro_temp[1] = (int16_t)(((int16_t)data[8] << 8) | data[9]);
+        gyro_temp[2] = (int16_t)(((int16_t)data[10] << 8) | data[11]);
+
+        accel_bias[0] += (int32_t)accel_temp[0];  // Sum individual signed 16-bit biases to get accumulated signed 32-bit biases
+        accel_bias[1] += (int32_t)accel_temp[1];
+        accel_bias[2] += (int32_t)accel_temp[2];
+        gyro_bias[0] += (int32_t)gyro_temp[0];
+        gyro_bias[1] += (int32_t)gyro_temp[1];
+        gyro_bias[2] += (int32_t)gyro_temp[2];
+    }
+    accel_bias[0] /= (int32_t)packet_count;  // Normalize sums to get average count biases
+    accel_bias[1] /= (int32_t)packet_count;
+    accel_bias[2] /= (int32_t)packet_count;
+    gyro_bias[0] /= (int32_t)packet_count;
+    gyro_bias[1] /= (int32_t)packet_count;
+    gyro_bias[2] /= (int32_t)packet_count;
+
+    if (accel_bias[2] > 0L) {
+        accel_bias[2] -= (int32_t)accelsensitivity;
+    }  // Remove gravity from the z-axis accelerometer bias calculation
+    else {
+        accel_bias[2] += (int32_t)accelsensitivity;
+    }
+
+    // Construct the gyro biases for push to the hardware gyro bias registers, which are reset to zero upon device startup
+    data[0] = (-gyro_bias[0] / 4 >> 8) & 0xFF;  // Divide by 4 to get 32.9 LSB per deg/s to conform to expected bias input format
+    data[1] = (-gyro_bias[0] / 4) & 0xFF;       // Biases are additive, so change sign on calculated average gyro biases
+    data[2] = (-gyro_bias[1] / 4 >> 8) & 0xFF;
+    data[3] = (-gyro_bias[1] / 4) & 0xFF;
+    data[4] = (-gyro_bias[2] / 4 >> 8) & 0xFF;
+    data[5] = (-gyro_bias[2] / 4) & 0xFF;
+
+    // Push gyro biases to hardware registers
+    wiringPiI2CWriteReg8(mpu, XG_OFFSET_H, data[0]);
+    wiringPiI2CWriteReg8(mpu, XG_OFFSET_L, data[1]);
+    wiringPiI2CWriteReg8(mpu, YG_OFFSET_H, data[2]);
+    wiringPiI2CWriteReg8(mpu, YG_OFFSET_L, data[3]);
+    wiringPiI2CWriteReg8(mpu, ZG_OFFSET_H, data[4]);
+    wiringPiI2CWriteReg8(mpu, ZG_OFFSET_L, data[5]);
+
+    // Construct the accelerometer biases for push to the hardware accelerometer bias registers. These registers contain
+    // factory trim values which must be added to the calculated accelerometer biases; on boot up these registers will hold
+    // non-zero values. In addition, bit 0 of the lower byte must be preserved since it is used for temperature
+    // compensation calculations. Accelerometer bias registers expect bias input as 2048 LSB per g, so that
+    // the accelerometer biases calculated above must be divided by 8.
+
+    int32_t accel_bias_reg[3] = {0, 0, 0};  // A place to hold the factory accelerometer trim biases
+    // readBytes(MPU9250_ADDRESS, XA_OFFSET_H, 2, &data[0]);  // Read factory accelerometer trim values
+    data[0] = wiringPiI2CReadReg8(mpu, XA_OFFSET_H);
+    data[1] = wiringPiI2CReadReg8(mpu, XA_OFFSET_L);
+    accel_bias_reg[0] = (int32_t)(((int16_t)data[0] << 8) | data[1]);
+    // readBytes(MPU9250_ADDRESS, YA_OFFSET_H, 2, &data[0]);
+    data[0] = wiringPiI2CReadReg8(mpu, YA_OFFSET_H);
+    data[1] = wiringPiI2CReadReg8(mpu, YA_OFFSET_L);
+    accel_bias_reg[1] = (int32_t)(((int16_t)data[0] << 8) | data[1]);
+    // readBytes(MPU9250_ADDRESS, ZA_OFFSET_H, 2, &data[0]);
+    data[0] = wiringPiI2CReadReg8(mpu, ZA_OFFSET_H);
+    data[1] = wiringPiI2CReadReg8(mpu, ZA_OFFSET_L);
+    accel_bias_reg[2] = (int32_t)(((int16_t)data[0] << 8) | data[1]);
+
+    uint32_t mask = 1uL;              // Define mask for temperature compensation bit 0 of lower byte of accelerometer bias registers
+    uint8_t mask_bit[3] = {0, 0, 0};  // Define array to hold mask bit for each accelerometer bias axis
+
+    for (ii = 0; ii < 3; ii++) {
+        if ((accel_bias_reg[ii] & mask)) mask_bit[ii] = 0x01;  // If temperature compensation bit is set, record that fact in mask_bit
+    }
+
+    // Construct total accelerometer bias, including calculated average accelerometer bias from above
+    accel_bias_reg[0] -= (accel_bias[0] / 8);  // Subtract calculated averaged accelerometer bias scaled to 2048 LSB/g (16 g full scale)
+    accel_bias_reg[1] -= (accel_bias[1] / 8);
+    accel_bias_reg[2] -= (accel_bias[2] / 8);
+
+    data[0] = (accel_bias_reg[0] >> 8) & 0xFF;
+    data[1] = (accel_bias_reg[0]) & 0xFF;
+    data[1] = data[1] | mask_bit[0];  // preserve temperature compensation bit when writing back to accelerometer bias registers
+    data[2] = (accel_bias_reg[1] >> 8) & 0xFF;
+    data[3] = (accel_bias_reg[1]) & 0xFF;
+    data[3] = data[3] | mask_bit[1];  // preserve temperature compensation bit when writing back to accelerometer bias registers
+    data[4] = (accel_bias_reg[2] >> 8) & 0xFF;
+    data[5] = (accel_bias_reg[2]) & 0xFF;
+    data[5] = data[5] | mask_bit[2];  // preserve temperature compensation bit when writing back to accelerometer bias registers
+
+    // Apparently this is not working for the acceleration biases in the MPU-9250
+    // Are we handling the temperature correction bit properly?
+    // Push accelerometer biases to hardware registers
+    wiringPiI2CWriteReg8(mpu, XA_OFFSET_H, data[0]);
+    wiringPiI2CWriteReg8(mpu, XA_OFFSET_L, data[1]);
+    wiringPiI2CWriteReg8(mpu, YA_OFFSET_H, data[2]);
+    wiringPiI2CWriteReg8(mpu, YA_OFFSET_L, data[3]);
+    wiringPiI2CWriteReg8(mpu, ZA_OFFSET_H, data[4]);
+    wiringPiI2CWriteReg8(mpu, ZA_OFFSET_L, data[5]);
 }
 
 int main() {
     // int fd, result;
     mpu = wiringPiI2CSetup(MPU9250_ADDRESS);
+    initMPU9250();
+    calibrateMPU9250();
     // enable mag: (https://stackoverflow.com/questions/43920137/magnetometer-data-on-mpu-9250-uclinux)
     wiringPiI2CWriteReg8(mpu, 0x37, 0x22);
 
